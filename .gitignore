@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Downloaded on first run when mediapipe lacks mp.solutions
+models/
