@@ -1,37 +1,46 @@
 """AR Hand Filter: a real-time "director's frame" gesture filter.
 
 Captures a webcam feed, tracks hands with Google MediaPipe, and detects the
-"director's frame" gesture: two hands with the thumb and index finger spread
-apart. A thin white frame joins the four fingertips and the active image filter
-is applied inside it (or to the whole image, see the ``F`` key).
+"director's frame" gesture: a left and a right hand with the thumb and index
+finger spread apart. A thin white frame joins the four fingertips and the
+active image filter is applied inside it (or to the whole image).
+
+Up to four hands are tracked by default, so two people can share one frame
+(one hand each) or each make their own; every left/right pair forms a frame.
 
 Camera capture and hand tracking run on their own threads, so the preview runs
-at the camera's frame rate even when tracking is slower.
+at the camera's frame rate even when tracking is slower. The picture is scaled
+to the window (or screen) keeping its aspect ratio, so faces never stretch.
 
 Controls:
     N / S / G / I / H   Normal / Sepia / Grayscale / Invert / Hologram
     TAB                 Cycle to the next filter
     Pinch               Touch thumb and middle fingertips: next filter
-    F                   Toggle filter scope: inside the frame / full image
+    F                   Toggle fullscreen
+    Z                   Toggle fit (black bars) / fill (crop) when the window
+                        shape differs from the camera's
+    A                   Toggle filter scope: inside the frames / all of the image
+    U                   Show / hide the key hints
     D                   Toggle landmark debug overlay
-    Q / ESC             Quit
+    ESC                 Leave fullscreen, or quit when windowed
+    Q                   Quit
 
 Usage:
-    python ar_hand_filter.py [--camera 0] [--max-hands 2] [--no-mirror] [--rect]
+    python ar_hand_filter.py [--camera 0] [--fullscreen] [--max-hands 4]
+                             [--resolution 1280x720] [--no-mirror] [--rect]
     python ar_hand_filter.py --list-cameras
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
 import math
 import sys
 import threading
 import time
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -48,7 +57,8 @@ WINDOW_NAME = "AR Hand Filter"
 MIN_DETECTION_CONFIDENCE = 0.7
 MIN_TRACKING_CONFIDENCE = 0.7
 MIN_PRESENCE_CONFIDENCE = 0.5  # lower than detection so a found hand is kept
-DEFAULT_MAX_HANDS = 2
+DEFAULT_MAX_HANDS = 4          # two people, both hands
+DEFAULT_RESOLUTION = (1280, 720)
 
 # Hand tracking runs on a downscaled copy of the frame. MediaPipe's models
 # work at ~224 px internally, so this costs no accuracy and saves time.
@@ -65,19 +75,26 @@ MIDDLE_MCP, MIDDLE_TIP = 9, 12
 PINCH_CLOSED_RATIO = 0.20   # thumb/index tip gap at which a pinch is certain
 PINCH_OPEN_RATIO = 0.60     # gap at which the fingers are clearly apart
 FRAME_ENTER_THRESHOLD = 0.5  # hand confidence needed to start a frame
-FRAME_STAY_THRESHOLD = 0.3   # lower bar to keep an existing frame (no flicker)
+FRAME_STAY_THRESHOLD = 0.3   # lower bar for a hand already holding a frame
 MIN_FRAME_SIZE_PX = 40
+
+# Pairing hands into frames: extra cost (in palm sizes) for pairing two hands
+# that MediaPipe labels the same side. Handedness is usually right but can
+# flip on odd poses, so it is a strong preference rather than a hard rule.
+SAME_SIDE_PAIR_PENALTY = 8.0
 
 # Thumb + middle fingertip pinch that switches filter.
 SWITCH_PINCH_ON = 0.6       # confidence that fires a switch
 SWITCH_PINCH_OFF = 0.2      # confidence below which the pinch counts as released
 SWITCH_COOLDOWN_S = 0.6
 
-# Frame smoothing (One Euro filter) and how long the frame survives a
-# momentary tracking dropout.
+# Frame smoothing (One Euro filter), how long a frame survives a momentary
+# tracking dropout, and how far a frame may move between results and still
+# count as the same frame (in multiples of its own size).
 SMOOTH_MIN_CUTOFF = 1.5     # Hz; lower = steadier when still
 SMOOTH_BETA = 0.01          # higher = less lag when moving fast
 FRAME_HOLD_S = 0.25
+FRAME_MATCH_RATIO = 0.75
 
 # Tasks API fallback (mediapipe releases that no longer ship mp.solutions).
 HAND_MODEL_URL = (
@@ -105,12 +122,20 @@ HOLOGRAM_LUT = np.clip(
 HOLOGRAM_LINE_PERIOD = 4    # rows per scanline cycle
 
 FRAME_COLOR = (255, 255, 255)
-FRAME_THICKNESS = 2
 LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
+UI_BASE_HEIGHT = 720        # overlay sizes are designed for this display height
 
 # A frame as 4 corner points, shape (4, 2): left index tip, right index tip,
 # right thumb tip, left thumb tip.
 Quad = np.ndarray
+
+
+@dataclass
+class Hand:
+    """One tracked hand: 21 landmark pixel coordinates and its side."""
+
+    points: np.ndarray            # (21, 2) float32, pixel coordinates
+    label: str = ""               # "Left" / "Right" as reported by MediaPipe
 
 
 # ---------------------------------------------------------------------------
@@ -213,33 +238,61 @@ def quad_to_rect(quad: Quad) -> Quad:
     return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
 
 
-def compute_frame_quad(
-    hands: Sequence[np.ndarray], threshold: float = FRAME_ENTER_THRESHOLD
-) -> Optional[Quad]:
-    """Find the director's frame formed by two hands.
+def quad_size(quad: Quad) -> float:
+    """Return the diagonal of a quad's bounding box, in pixels."""
+    return float(np.hypot(*(quad.max(axis=0) - quad.min(axis=0))))
 
-    When more than two hands qualify, the pair framing the largest area is
-    used, so a bystander's hand does not hijack the frame.
 
-    Args:
-        hands: Landmark arrays, one (21, 2) array per detected hand.
-        threshold: Minimum :func:`frame_confidence` for a hand to take part.
+def _pair_cost(hand_a: Hand, hand_b: Hand) -> Optional[float]:
+    """Cost of pairing two hands into a frame, or None if they cannot pair.
 
-    Returns:
-        The (4, 2) corner points in pixels, or ``None`` if no frame is formed.
+    Nearby hands are cheaper, measured in palm sizes so it holds at any
+    distance from the camera, and a left + right pair is strongly preferred.
     """
-    candidates = [h for h in hands if frame_confidence(h, palm_size(h)) >= threshold]
-    best: Optional[Quad] = None
-    best_area = 0.0
-    for hand_a, hand_b in itertools.combinations(candidates, 2):
-        quad = frame_quad(hand_a, hand_b)
-        width, height = quad.max(axis=0) - quad.min(axis=0)
-        if width < MIN_FRAME_SIZE_PX or height < MIN_FRAME_SIZE_PX:
-            continue
-        area = abs(cv2.contourArea(quad))
-        if area >= best_area:
-            best, best_area = quad, area
-    return best
+    quad = frame_quad(hand_a.points, hand_b.points)
+    width, height = quad.max(axis=0) - quad.min(axis=0)
+    if width < MIN_FRAME_SIZE_PX or height < MIN_FRAME_SIZE_PX:
+        return None
+    palm = (palm_size(hand_a.points) + palm_size(hand_b.points)) / 2
+    gap = distance(hand_a.points[INDEX_TIP], hand_b.points[INDEX_TIP]) / max(palm, 1e-6)
+    same_side = hand_a.label and hand_a.label == hand_b.label
+    return gap + (SAME_SIDE_PAIR_PENALTY if same_side else 0.0)
+
+
+def pair_hands(hands: Sequence[Hand]) -> list[tuple[Hand, Hand]]:
+    """Split hands into frame-forming pairs.
+
+    Chooses the pairing that forms the most frames, breaking ties by the
+    lowest total cost (see :func:`_pair_cost`). With two people and four
+    hands this pairs each person's own hands; when only one hand each is up,
+    those two pair across the couple. Exhaustive, which is instant for the
+    handful of hands MediaPipe tracks.
+    """
+    n = len(hands)
+    costs = {
+        (i, j): c
+        for i in range(n) for j in range(i + 1, n)
+        if (c := _pair_cost(hands[i], hands[j])) is not None
+    }
+
+    def best(remaining: tuple[int, ...]) -> tuple[int, float, list[tuple[int, int]]]:
+        if len(remaining) < 2:
+            return 0, 0.0, []
+        first, rest = remaining[0], remaining[1:]
+        # Option 1: leave ``first`` unpaired.
+        result = best(rest)
+        # Option 2: pair ``first`` with each partner it can pair with.
+        for k, other in enumerate(rest):
+            cost = costs.get((first, other))
+            if cost is None:
+                continue
+            count, total, pairs = best(rest[:k] + rest[k + 1:])
+            candidate = (count + 1, total + cost, [(first, other)] + pairs)
+            if (candidate[0], -candidate[1]) > (result[0], -result[1]):
+                result = candidate
+        return result
+
+    return [(hands[i], hands[j]) for i, j in best(tuple(range(n)))[2]]
 
 
 class OneEuroFilter:
@@ -287,29 +340,75 @@ class OneEuroFilter:
         return self._x
 
 
+@dataclass
+class TrackedFrame:
+    """A frame followed across tracking results, with its own smoothing."""
+
+    quad: Quad
+    last_seen: float
+    smoother: OneEuroFilter = field(default_factory=OneEuroFilter)
+
+
 class FrameTracker:
-    """Turns per-detection hands into a stable, smoothed frame."""
+    """Turns per-detection hands into stable, smoothed frames (any number)."""
 
     def __init__(self, rect: bool = False, hold_s: float = FRAME_HOLD_S) -> None:
         self.rect = rect
         self.hold_s = hold_s
-        self.smoother = OneEuroFilter()
-        self.quad: Optional[Quad] = None
-        self._last_seen = -math.inf
+        self.frames: list[TrackedFrame] = []
 
-    def update(self, hands: Sequence[np.ndarray], t: float) -> Optional[Quad]:
-        """Feed one tracking result taken at time ``t`` and return the frame."""
-        # Hysteresis: once a frame is showing, hands may relax a little.
-        threshold = FRAME_STAY_THRESHOLD if self.quad is not None else FRAME_ENTER_THRESHOLD
-        raw = compute_frame_quad(hands, threshold)
-        if raw is not None:
-            if self.quad is None:
-                self.smoother.reset()
-            self.quad = self.smoother(quad_to_rect(raw) if self.rect else raw, t)
-            self._last_seen = t
-        elif t - self._last_seen > self.hold_s:
-            self.quad = None
-        return self.quad
+    @property
+    def quads(self) -> list[Quad]:
+        """Current frame corners, one (4, 2) array per frame."""
+        return [f.quad for f in self.frames]
+
+    def _holds_frame(self, hand: Hand) -> bool:
+        """True if one of the hand's fingertips sits on an existing frame corner."""
+        reach = palm_size(hand.points)
+        tips = hand.points[[INDEX_TIP, THUMB_TIP]]
+        return any(
+            np.min(np.linalg.norm(f.quad[:, None] - tips[None], axis=-1)) < reach
+            for f in self.frames
+        )
+
+    def update(self, hands: Sequence[Hand], t: float) -> list[Quad]:
+        """Feed one tracking result taken at time ``t`` and return the frames."""
+        # Hysteresis: a hand already holding a frame may relax a little.
+        candidates = [
+            h for h in hands
+            if frame_confidence(h.points, palm_size(h.points))
+            >= (FRAME_STAY_THRESHOLD if self._holds_frame(h) else FRAME_ENTER_THRESHOLD)
+        ]
+        raw_quads = [frame_quad(a.points, b.points) for a, b in pair_hands(candidates)]
+        if self.rect:
+            raw_quads = [quad_to_rect(q) for q in raw_quads]
+
+        # Match each new quad to the nearest existing frame (greedy, closest
+        # first) so every frame keeps its own smoothing history.
+        unmatched = list(range(len(self.frames)))
+        matches: dict[int, int] = {}
+        pairs = sorted(
+            (distance(q.mean(axis=0), f.quad.mean(axis=0)), qi, fi)
+            for qi, q in enumerate(raw_quads)
+            for fi, f in enumerate(self.frames)
+        )
+        for dist, qi, fi in pairs:
+            if qi in matches or fi not in unmatched:
+                continue
+            if dist <= FRAME_MATCH_RATIO * max(quad_size(self.frames[fi].quad), 100.0):
+                matches[qi] = fi
+                unmatched.remove(fi)
+
+        updated: list[TrackedFrame] = []
+        for qi, quad in enumerate(raw_quads):
+            frame = self.frames[matches[qi]] if qi in matches else TrackedFrame(quad, t)
+            frame.quad = frame.smoother(quad, t)
+            frame.last_seen = t
+            updated.append(frame)
+        # Frames that lost a hand survive briefly, so a dropped frame doesn't flicker.
+        updated += [self.frames[fi] for fi in unmatched if t - self.frames[fi].last_seen <= self.hold_s]
+        self.frames = updated
+        return self.quads
 
 
 class PinchSwitch:
@@ -320,9 +419,11 @@ class PinchSwitch:
         self._armed = True
         self._last_fire = -math.inf
 
-    def update(self, hands: Sequence[np.ndarray], t: float) -> bool:
+    def update(self, hands: Sequence[Hand], t: float) -> bool:
         """Feed one tracking result; return True when a switch should happen."""
-        strength = max((switch_pinch_confidence(h, palm_size(h)) for h in hands), default=0.0)
+        strength = max(
+            (switch_pinch_confidence(h.points, palm_size(h.points)) for h in hands), default=0.0
+        )
         if strength <= SWITCH_PINCH_OFF:
             self._armed = True
         elif strength >= SWITCH_PINCH_ON and self._armed and t - self._last_fire >= self.cooldown_s:
@@ -410,34 +511,36 @@ class FilterState:
         if key == 9:  # TAB
             self.next()
             return True
-        if key in (ord("f"), ord("F")):
+        if key in (ord("a"), ord("A")):
             self.inside_frame_only = not self.inside_frame_only
             return True
         return False
 
-    def apply(self, frame: np.ndarray, quad: Optional[Quad]) -> None:
+    def apply(self, frame: np.ndarray, quads: Sequence[Quad]) -> None:
         """Apply the active filter to ``frame`` in place.
 
-        In frame-only mode the filter is applied inside ``quad`` and nothing
-        changes when no frame is shown. Otherwise the whole image is filtered.
-        Only the frame's bounding box is filtered, then masked to its shape.
+        In frame-only mode the filter is applied inside the ``quads`` and
+        nothing changes when no frame is shown. Otherwise the whole image is
+        filtered. Only the frames' bounding box is filtered, once, then masked
+        to their shapes, so overlapping frames are not filtered twice.
         """
         if self.current.apply is filter_normal:
             return
         if not self.inside_frame_only:
             frame[:] = self.current.apply(frame)
             return
-        if quad is None:
+        if not quads:
             return
         height, width = frame.shape[:2]
-        pts = np.round(quad).astype(np.int32)
-        x1, y1 = np.clip(pts.min(axis=0), 0, [width, height])
-        x2, y2 = np.clip(pts.max(axis=0) + 1, 0, [width, height])
+        polys = [np.round(q).astype(np.int32) for q in quads]
+        corners = np.vstack(polys)
+        x1, y1 = np.clip(corners.min(axis=0), 0, [width, height])
+        x2, y2 = np.clip(corners.max(axis=0) + 1, 0, [width, height])
         if x2 - x1 < 2 or y2 - y1 < 2:
             return
         roi = frame[y1:y2, x1:x2]
         mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-        cv2.fillPoly(mask, [pts - (x1, y1)], 255)
+        cv2.fillPoly(mask, [p - (x1, y1) for p in polys], 255)
         np.copyto(roi, self.current.apply(roi), where=mask[..., None].astype(bool))
 
 
@@ -499,7 +602,7 @@ class HandTracker:
 
     def process(
         self, frame_bgr: np.ndarray, output_size: Optional[tuple[int, int]] = None
-    ) -> list[np.ndarray]:
+    ) -> list[Hand]:
         """Detect hands in a BGR frame.
 
         Args:
@@ -509,7 +612,7 @@ class HandTracker:
                 Defaults to the size of ``frame_bgr``.
 
         Returns:
-            One (21, 2) float32 array of pixel coordinates per detected hand.
+            One :class:`Hand` per detected hand.
         """
         height, width = frame_bgr.shape[:2]
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -519,16 +622,20 @@ class HandTracker:
             rgb.flags.writeable = False
             results = self._hands.process(rgb)
             hand_list = [h.landmark for h in (results.multi_hand_landmarks or [])]
+            labels = [h.classification[0].label for h in (results.multi_handedness or [])]
         else:
             # VIDEO mode requires strictly increasing timestamps.
             timestamp_ms = max(int(time.monotonic() * 1000), self._last_timestamp_ms + 1)
             self._last_timestamp_ms = timestamp_ms
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            hand_list = self._hands.detect_for_video(image, timestamp_ms).hand_landmarks
+            results = self._hands.detect_for_video(image, timestamp_ms)
+            hand_list = results.hand_landmarks
+            labels = [h[0].category_name if h else "" for h in results.handedness]
 
+        labels += [""] * (len(hand_list) - len(labels))
         return [
-            np.array([(lm.x, lm.y) for lm in landmarks], dtype=np.float32) * scale
-            for landmarks in hand_list
+            Hand(np.array([(lm.x, lm.y) for lm in landmarks], dtype=np.float32) * scale, label)
+            for landmarks, label in zip(hand_list, labels)
         ]
 
     def close(self) -> None:
@@ -542,7 +649,7 @@ class TrackingResult:
 
     seq: int
     timestamp: float
-    hands: list[np.ndarray]
+    hands: list[Hand]
 
 
 class HandWorker:
@@ -698,8 +805,8 @@ def _open_capture(index: int, backend: int, width: int, height: int) -> Optional
 def open_camera(
     index: int = 0,
     backend: str = "auto",
-    width: int = 1280,
-    height: int = 720,
+    width: int = DEFAULT_RESOLUTION[0],
+    height: int = DEFAULT_RESOLUTION[1],
     warmup_s: float = 3.0,
 ) -> cv2.VideoCapture:
     """Open a webcam and confirm it delivers frames.
@@ -758,7 +865,7 @@ def list_cameras(max_index: int = 5, backend: str = "auto") -> int:
     print("Probing cameras (this takes a few seconds)...")
     for index in range(max_index):
         for api in camera_backends(backend):
-            cap = _open_capture(index, api, 1280, 720)
+            cap = _open_capture(index, api, *DEFAULT_RESOLUTION)
             if cap is None:
                 continue
             frame = read_first_frame(cap, 1.5)
@@ -823,28 +930,92 @@ class CameraStream:
 
 
 # ---------------------------------------------------------------------------
-# UI overlays
+# Display
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ViewTransform:
+    """Maps camera-frame pixels to display-canvas pixels: ``p * scale + offset``."""
+
+    scale: float
+    offset: tuple[float, float]
+
+    def apply(self, points: np.ndarray) -> np.ndarray:
+        """Transform an (N, 2) array of camera-frame points to canvas points."""
+        return points * self.scale + np.asarray(self.offset, dtype=np.float32)
+
+
+def compose_view(
+    frame: np.ndarray, canvas_size: tuple[int, int], fill: bool
+) -> tuple[np.ndarray, ViewTransform]:
+    """Scale a frame onto a canvas of ``canvas_size`` without distorting it.
+
+    Args:
+        frame: Camera frame.
+        canvas_size: ``(width, height)`` of the window's drawing area.
+        fill: Crop the frame to cover the whole canvas (True) or show all
+            of it with black bars on the sides that don't fit (False).
+
+    Returns:
+        The canvas and the transform from frame to canvas coordinates.
+    """
+    height, width = frame.shape[:2]
+    canvas_w, canvas_h = canvas_size
+    if (canvas_w, canvas_h) == (width, height):
+        return frame, ViewTransform(1.0, (0.0, 0.0))
+
+    interpolation = cv2.INTER_LINEAR
+    if fill:
+        scale = max(canvas_w / width, canvas_h / height)
+        crop_w, crop_h = canvas_w / scale, canvas_h / scale
+        x0, y0 = (width - crop_w) / 2, (height - crop_h) / 2
+        cropped = frame[int(y0):int(y0) + math.ceil(crop_h), int(x0):int(x0) + math.ceil(crop_w)]
+        if scale < 1:
+            interpolation = cv2.INTER_AREA
+        canvas = cv2.resize(cropped, (canvas_w, canvas_h), interpolation=interpolation)
+        return canvas, ViewTransform(scale, (-int(x0) * scale, -int(y0) * scale))
+
+    scale = min(canvas_w / width, canvas_h / height)
+    new_w, new_h = max(1, round(width * scale)), max(1, round(height * scale))
+    x0, y0 = (canvas_w - new_w) // 2, (canvas_h - new_h) // 2
+    if scale < 1:
+        interpolation = cv2.INTER_AREA
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = cv2.resize(frame, (new_w, new_h), interpolation=interpolation)
+    return canvas, ViewTransform(scale, (float(x0), float(y0)))
+
+
+def window_size(name: str) -> Optional[tuple[int, int]]:
+    """Return the drawing area of a window, or None if it is unknown."""
+    try:
+        _, _, width, height = cv2.getWindowImageRect(name)
+    except cv2.error:
+        return None
+    if width < 32 or height < 32:  # minimised or not laid out yet
+        return None
+    return width, height
+
 
 def draw_label(
     image: np.ndarray,
     text: str,
     anchor: str,
     scale: float = 0.6,
-    margin: int = 10,
-    padding: int = 6,
+    ui: float = 1.0,
 ) -> None:
     """Draw white text on a solid black box.
 
     Args:
-        image: Frame to draw on (modified in place).
+        image: Canvas to draw on (modified in place).
         text: Label text.
         anchor: ``"top-left"``, ``"top-right"``, ``"bottom-center"`` or ``"center"``.
-        scale: Font scale.
-        margin: Distance from the image edge, in pixels.
-        padding: Space between the text and the box edge, in pixels.
+        scale: Font scale at a 720 px tall display.
+        ui: Display size factor (see ``UI_BASE_HEIGHT``) applied to font,
+            padding and margin.
     """
-    thickness = 1 if scale < 0.6 else 2
+    scale *= ui
+    margin, padding = round(10 * ui), round(6 * ui)
+    thickness = max(1, round(ui * (1 if scale / ui < 0.6 else 2)))
     (text_w, text_h), baseline = cv2.getTextSize(text, LABEL_FONT, scale, thickness)
     box_w, box_h = text_w + 2 * padding, text_h + baseline + 2 * padding
     height, width = image.shape[:2]
@@ -867,24 +1038,27 @@ def draw_label(
     )
 
 
-def draw_frame(image: np.ndarray, quad: Quad) -> None:
-    """Draw the director's frame: thin white edges with small corner dots."""
+def draw_frame(image: np.ndarray, quad: Quad, ui: float = 1.0) -> None:
+    """Draw a director's frame: thin white edges with small corner dots."""
     pts = np.round(quad).astype(np.int32)
-    cv2.polylines(image, [pts], True, FRAME_COLOR, FRAME_THICKNESS, cv2.LINE_AA)
+    cv2.polylines(image, [pts], True, FRAME_COLOR, max(1, round(2 * ui)), cv2.LINE_AA)
     for x, y in pts:
-        cv2.circle(image, (int(x), int(y)), 4, FRAME_COLOR, cv2.FILLED, cv2.LINE_AA)
+        cv2.circle(image, (int(x), int(y)), max(2, round(4 * ui)), FRAME_COLOR, cv2.FILLED, cv2.LINE_AA)
 
 
-def draw_debug_landmarks(image: np.ndarray, hands: Sequence[np.ndarray]) -> None:
+def draw_debug_landmarks(
+    image: np.ndarray, hands: Sequence[Hand], view: ViewTransform, ui: float = 1.0
+) -> None:
     """Mark each hand's landmarks, colouring hands that can hold a frame green."""
-    for points in hands:
-        confidence = frame_confidence(points, palm_size(points))
+    for hand in hands:
+        confidence = frame_confidence(hand.points, palm_size(hand.points))
         color = (0, 220, 0) if confidence >= FRAME_ENTER_THRESHOLD else (0, 0, 220)
-        for x, y in points.astype(int):
-            cv2.circle(image, (int(x), int(y)), 3, color, cv2.FILLED)
-        wx, wy = points[WRIST].astype(int)
-        cv2.putText(image, f"{confidence:.2f}", (int(wx), int(wy) + 20),
-                    LABEL_FONT, 0.5, color, 1, cv2.LINE_AA)
+        points = view.apply(hand.points).astype(int)
+        for x, y in points:
+            cv2.circle(image, (int(x), int(y)), max(2, round(3 * ui)), color, cv2.FILLED)
+        wx, wy = points[WRIST]
+        cv2.putText(image, f"{hand.label[:1]} {confidence:.2f}", (int(wx), int(wy) + round(20 * ui)),
+                    LABEL_FONT, 0.5 * ui, color, max(1, round(ui)), cv2.LINE_AA)
 
 
 class FpsCounter:
@@ -910,9 +1084,10 @@ class FpsCounter:
 # ---------------------------------------------------------------------------
 
 class ARHandFilterApp:
-    """Main loop: capture, track, detect the frame gesture, filter, render."""
+    """Main loop: capture, track, detect frame gestures, filter, render."""
 
-    HINT = "Pinch thumb+middle or TAB: next filter   N/S/G/I/H   F: frame/full   D: debug   Q: quit"
+    HINT = ("Pinch thumb+middle / TAB: next filter   N S G I H   F: fullscreen   "
+            "Z: fit/fill   A: filter all   U: hide hints   Q: quit")
 
     def __init__(
         self,
@@ -921,24 +1096,30 @@ class ARHandFilterApp:
         mirror: bool = True,
         backend: str = "auto",
         rect: bool = False,
+        fullscreen: bool = False,
+        resolution: tuple[int, int] = DEFAULT_RESOLUTION,
     ) -> None:
         self.camera_index = camera_index
         self.backend = backend
         self.max_hands = max_hands
         self.mirror = mirror
+        self.resolution = resolution
+        self.fullscreen = fullscreen
+        self.fill = False
+        self.show_hints = True
+        self.debug = False
         self.filters = FilterState()
         self.frame_tracker = FrameTracker(rect=rect)
         self.pinch_switch = PinchSwitch()
         self.fps = FpsCounter()
         self.tracking_fps = FpsCounter()
-        self.debug = False
         self._result_seq = 0
-        self._hands: list[np.ndarray] = []
+        self._hands: list[Hand] = []
 
     def run(self) -> int:
         """Run until the user quits. Returns a process exit code."""
         try:
-            cap = open_camera(self.camera_index, self.backend)
+            cap = open_camera(self.camera_index, self.backend, *self.resolution)
         except CameraError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -951,7 +1132,13 @@ class ARHandFilterApp:
             return 1
 
         camera = CameraStream(cap)
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        # FREERATIO + GUI_NORMAL: on the Qt backend the drawing area is the
+        # whole window, so window_size() is what we draw. Aspect ratio is
+        # handled by compose_view(), not by OpenCV stretching.
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL | cv2.WINDOW_FREERATIO | cv2.WINDOW_GUI_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.resolution[0],
+                         int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.resolution[1])
+        self._apply_fullscreen()
         seq = 0
         try:
             while True:
@@ -963,17 +1150,11 @@ class ARHandFilterApp:
                     print(f"Error: hand tracking failed: {worker.error}", file=sys.stderr)
                     return 1
 
-                self.render(frame, worker)
-                cv2.imshow(WINDOW_NAME, frame)
+                canvas = self.render(frame, worker, window_size(WINDOW_NAME))
+                cv2.imshow(WINDOW_NAME, canvas)
 
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), ord("Q"), 27):
+                if not self.handle_key(cv2.waitKey(1) & 0xFF):
                     break
-                if key in (ord("d"), ord("D")):
-                    self.debug = not self.debug
-                elif key != 0xFF:
-                    self.filters.handle_key(key)
-
                 # Closing the window with its X button ends the app.
                 if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                     break
@@ -983,8 +1164,43 @@ class ARHandFilterApp:
             cv2.destroyAllWindows()
         return 0
 
-    def render(self, frame: np.ndarray, worker: HandWorker) -> None:
-        """Process one frame in place: track hands, filter and draw overlays."""
+    def _apply_fullscreen(self) -> None:
+        mode = cv2.WINDOW_FULLSCREEN if self.fullscreen else cv2.WINDOW_NORMAL
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, mode)
+
+    def handle_key(self, key: int) -> bool:
+        """React to a key press. Returns False when the app should quit."""
+        if key == 0xFF:
+            return True
+        if key in (ord("q"), ord("Q")):
+            return False
+        if key == 27:  # ESC leaves fullscreen first, then quits
+            if not self.fullscreen:
+                return False
+            self.fullscreen = False
+            self._apply_fullscreen()
+        elif key in (ord("f"), ord("F")):
+            self.fullscreen = not self.fullscreen
+            self._apply_fullscreen()
+        elif key in (ord("z"), ord("Z")):
+            self.fill = not self.fill
+        elif key in (ord("u"), ord("U")):
+            self.show_hints = not self.show_hints
+        elif key in (ord("d"), ord("D")):
+            self.debug = not self.debug
+        else:
+            self.filters.handle_key(key)
+        return True
+
+    def render(
+        self, frame: np.ndarray, worker: HandWorker, canvas_size: Optional[tuple[int, int]] = None
+    ) -> np.ndarray:
+        """Process one camera frame and return the canvas to display.
+
+        Tracking, gestures and filters work on the camera frame; the result
+        is then scaled onto a canvas the size of the window, and the frame
+        outlines and labels are drawn crisply at display resolution.
+        """
         if self.mirror:
             cv2.flip(frame, 1, dst=frame)
 
@@ -1001,34 +1217,54 @@ class ARHandFilterApp:
             self.frame_tracker.update(result.hands, result.timestamp)
             if self.pinch_switch.update(result.hands, result.timestamp):
                 self.filters.next()
-        quad = self.frame_tracker.quad
+        quads = self.frame_tracker.quads
 
-        self.filters.apply(frame, quad)
-        if quad is not None:
-            draw_frame(frame, quad)
+        self.filters.apply(frame, quads)
+        canvas, view = compose_view(frame, canvas_size or (frame.shape[1], frame.shape[0]), self.fill)
+        ui = canvas.shape[0] / UI_BASE_HEIGHT
+
+        for quad in quads:
+            draw_frame(canvas, view.apply(quad), ui)
         if self.debug:
-            draw_debug_landmarks(frame, self._hands)
+            draw_debug_landmarks(canvas, self._hands, view, ui)
 
-        scope = "" if self.filters.inside_frame_only else " (full)"
-        draw_label(frame, f"Filter: {self.filters.current.name}{scope}", "top-left")
+        scope = "" if self.filters.inside_frame_only else " (all)"
+        draw_label(canvas, f"Filter: {self.filters.current.name}{scope}", "top-left", ui=ui)
         fps = f"{self.fps.tick():.0f} FPS"
         if self.debug:
-            fps += f" | track {self.tracking_fps.fps:.0f}/s"
-        draw_label(frame, fps, "top-right")
-        draw_label(frame, self.HINT, "bottom-center", scale=0.45)
+            fps += f" | track {self.tracking_fps.fps:.0f}/s | {len(self._hands)} hands"
+        draw_label(canvas, fps, "top-right", ui=ui)
+        if self.show_hints:
+            draw_label(canvas, self.HINT, "bottom-center", scale=0.42, ui=ui)
         if black:
-            draw_label(frame, "Camera sends black frames: open the shutter or try --list-cameras", "center", scale=0.55)
+            draw_label(canvas, "Camera sends black frames: open the shutter or try --list-cameras",
+                       "center", scale=0.55, ui=ui)
+        return canvas
+
+
+def parse_resolution(text: str) -> tuple[int, int]:
+    """Parse ``"WIDTHxHEIGHT"`` (e.g. ``1920x1080``) for argparse."""
+    try:
+        width, height = (int(v) for v in text.lower().split("x"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("use WIDTHxHEIGHT, e.g. 1920x1080") from None
+    if width < 160 or height < 120:
+        raise argparse.ArgumentTypeError("resolution too small")
+    return width, height
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse command-line options."""
     parser = argparse.ArgumentParser(description="Real-time AR director's-frame hand filter.")
     parser.add_argument("--camera", type=int, default=0, help="webcam index (default: 0)")
+    parser.add_argument("--fullscreen", action="store_true", help="start in fullscreen (toggle with F)")
+    parser.add_argument("--resolution", type=parse_resolution, default=DEFAULT_RESOLUTION,
+                        help="camera resolution to request, e.g. 1920x1080 (default: 1280x720)")
     parser.add_argument("--max-hands", type=int, default=DEFAULT_MAX_HANDS,
-                        help="maximum hands to track; use 4 for two people (default: 2)")
+                        help="maximum hands to track (default: 4, two people)")
     parser.add_argument("--no-mirror", action="store_true", help="do not mirror the preview")
     parser.add_argument("--rect", action="store_true",
-                        help="draw an axis-aligned rectangle instead of following the fingertips")
+                        help="draw axis-aligned rectangles instead of following the fingertips")
     parser.add_argument("--backend", choices=["auto", *CAMERA_BACKENDS], default="auto",
                         help="OpenCV capture backend (default: auto)")
     parser.add_argument("--list-cameras", action="store_true",
@@ -1050,6 +1286,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mirror=not args.no_mirror,
         backend=args.backend,
         rect=args.rect,
+        fullscreen=args.fullscreen,
+        resolution=args.resolution,
     )
     return app.run()
 
