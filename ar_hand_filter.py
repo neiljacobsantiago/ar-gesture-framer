@@ -27,9 +27,10 @@ import itertools
 import sys
 import time
 import urllib.request
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Optional
 
 import cv2
 import mediapipe as mp
@@ -90,7 +91,7 @@ BOX_COLOR = (255, 255, 255)
 BOX_THICKNESS = 2
 LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-Box = Tuple[int, int, int, int]  # x1, y1, x2, y2 (inclusive top-left, exclusive bottom-right)
+Box = tuple[int, int, int, int]  # x1, y1, x2, y2 (inclusive top-left, exclusive bottom-right)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +206,7 @@ def is_frame_hand(points: np.ndarray) -> bool:
     return frame_confidence(points, palm_size(points)) >= FRAME_CONFIDENCE_THRESHOLD
 
 
-def compute_frame_box(hands: Sequence[np.ndarray], frame_shape: Tuple[int, ...]) -> Optional[Box]:
+def compute_frame_box(hands: Sequence[np.ndarray], frame_shape: tuple[int, ...]) -> Optional[Box]:
     """Find the director's frame formed by two L-shaped hands.
 
     The box spans the minimum and maximum X/Y of the thumb and index tips of
@@ -299,7 +300,7 @@ class ImageFilter:
     apply: Callable[[np.ndarray], np.ndarray]
 
 
-FILTERS: Tuple[ImageFilter, ...] = (
+FILTERS: tuple[ImageFilter, ...] = (
     ImageFilter("Normal", "n", filter_normal),
     ImageFilter("Sepia", "s", filter_sepia),
     ImageFilter("Grayscale", "g", filter_grayscale),
@@ -312,7 +313,7 @@ class FilterState:
 
     def __init__(self, filters: Sequence[ImageFilter] = FILTERS, initial: str = "Sepia") -> None:
         self.filters = list(filters)
-        self._by_key: Dict[int, int] = {ord(f.key): i for i, f in enumerate(self.filters)}
+        self._by_key: dict[int, int] = {ord(f.key): i for i, f in enumerate(self.filters)}
         self._by_key.update({ord(f.key.upper()): i for i, f in enumerate(self.filters)})
         names = [f.name.lower() for f in self.filters]
         self.index = names.index(initial.lower()) if initial.lower() in names else 0
@@ -413,7 +414,7 @@ class HandTracker:
         except Exception as exc:  # mediapipe raises plain RuntimeError/ValueError
             raise HandTrackerError(f"Could not start the MediaPipe hand landmarker: {exc}") from exc
 
-    def process(self, frame_bgr: np.ndarray) -> List[np.ndarray]:
+    def process(self, frame_bgr: np.ndarray) -> list[np.ndarray]:
         """Detect hands in a BGR frame.
 
         Returns:
@@ -471,7 +472,7 @@ class CameraError(RuntimeError):
     """Raised when the webcam cannot be opened or read."""
 
 
-def camera_backends() -> List[int]:
+def camera_backends() -> list[int]:
     """Return the OpenCV capture backends to try, in order.
 
     On Windows the default Media Foundation backend often fails to deliver
