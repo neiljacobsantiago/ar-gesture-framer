@@ -471,34 +471,66 @@ class CameraError(RuntimeError):
     """Raised when the webcam cannot be opened or read."""
 
 
-def open_camera(index: int = 0, width: int = 1280, height: int = 720) -> cv2.VideoCapture:
+def camera_backends() -> List[int]:
+    """Return the OpenCV capture backends to try, in order.
+
+    On Windows the default Media Foundation backend often fails to deliver
+    frames from some webcams, so DirectShow is tried first.
+    """
+    if sys.platform == "win32":
+        return [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+    return [cv2.CAP_ANY]
+
+
+def wait_for_frame(cap: cv2.VideoCapture, timeout_s: float) -> bool:
+    """Read until a frame arrives or ``timeout_s`` passes (cameras need warm-up)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def open_camera(
+    index: int = 0, width: int = 1280, height: int = 720, warmup_s: float = 3.0
+) -> cv2.VideoCapture:
     """Open a webcam and confirm it delivers frames.
 
     A camera held by another application often opens "successfully" but
-    never returns a frame, so a test read is part of the check.
+    never returns a frame, so a test read is part of the check. Each capture
+    backend gets ``warmup_s`` seconds to produce its first frame.
 
     Raises:
         CameraError: If the device cannot be opened or produces no frames.
     """
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
+    opened = False
+    for backend in camera_backends():
+        cap = cv2.VideoCapture(index, backend)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        opened = True
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if wait_for_frame(cap, warmup_s):
+            return cap
         cap.release()
+
+    if not opened:
         raise CameraError(
             f"Could not open camera {index}. Check that a webcam is connected "
             "and that the app has camera permission."
         )
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        cap.release()
-        raise CameraError(
-            f"Camera {index} opened but returned no frames. It is probably in use "
-            "by another application (Zoom, Teams, OBS, a browser tab...). "
-            "Close it and try again, or pick another device with --camera."
-        )
-    return cap
+    raise CameraError(
+        f"Camera {index} opened but returned no frames. Check that:\n"
+        "  - no other app is using it (Zoom, Teams, OBS, a browser tab...)\n"
+        "  - Windows Settings > Privacy & security > Camera allows desktop apps\n"
+        "  - the laptop's camera privacy shutter/kill switch is off\n"
+        "  - it is the right device: try --camera 1 or --camera 2"
+    )
 
 
 # ---------------------------------------------------------------------------
