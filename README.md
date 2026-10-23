@@ -12,7 +12,7 @@ pip install -r requirements.txt
 python ar_hand_filter.py
 ```
 
-Options: `--camera 1` picks another webcam, `--max-hands 4` lets two people each use both hands,
+Options: `--camera 1` picks another webcam (`--list-cameras` shows which ones work), `--max-hands 4` lets two people each use both hands,
 and `--no-mirror` turns off the selfie-style flip.
 
 ## Controls
@@ -41,4 +41,6 @@ and `--no-mirror` turns off the selfie-style flip.
 - **Sepia:** `cv2.transform` with the standard sepia matrix, reordered for BGR.
 
 If the webcam is missing or held by another app (Zoom, Teams, OBS...), the script prints a clear
-error and exits with code 1 instead of crashing.
+error and exits with code 1 instead of crashing. If the preview is black, the camera's privacy
+shutter or kill switch is probably on, or index 0 is a virtual/IR camera: run
+`python ar_hand_filter.py --list-cameras` and pick an index marked OK.

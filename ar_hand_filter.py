@@ -18,6 +18,7 @@ Controls:
 
 Usage:
     python ar_hand_filter.py [--camera 0] [--max-hands 2] [--no-mirror]
+    python ar_hand_filter.py --list-cameras
 """
 
 from __future__ import annotations
@@ -472,54 +473,113 @@ class CameraError(RuntimeError):
     """Raised when the webcam cannot be opened or read."""
 
 
-def camera_backends() -> list[int]:
+CAMERA_BACKENDS = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF, "any": cv2.CAP_ANY}
+BACKEND_NAMES = {value: name for name, value in CAMERA_BACKENDS.items()}
+
+# A frame whose brightest pixel is below this is treated as black: what a
+# closed privacy shutter, a disabled camera or an idle virtual camera sends.
+BLACK_FRAME_MAX = 8
+
+
+def is_black(frame: np.ndarray) -> bool:
+    """Return True if every pixel in the frame is (almost) black."""
+    return int(frame.max()) < BLACK_FRAME_MAX
+
+
+def camera_backends(preference: str = "auto") -> list[int]:
     """Return the OpenCV capture backends to try, in order.
 
     On Windows the default Media Foundation backend often fails to deliver
     frames from some webcams, so DirectShow is tried first.
     """
+    if preference != "auto":
+        return [CAMERA_BACKENDS[preference]]
     if sys.platform == "win32":
         return [cv2.CAP_DSHOW, cv2.CAP_MSMF]
     return [cv2.CAP_ANY]
 
 
-def wait_for_frame(cap: cv2.VideoCapture, timeout_s: float) -> bool:
-    """Read until a frame arrives or ``timeout_s`` passes (cameras need warm-up)."""
+def read_first_frame(cap: cv2.VideoCapture, timeout_s: float) -> Optional[np.ndarray]:
+    """Read until a non-black frame arrives or ``timeout_s`` passes.
+
+    Cameras often need a moment to warm up, and some send black frames
+    before the first real one.
+
+    Returns:
+        The first non-black frame, else the last black frame read, else
+        ``None`` if the camera produced nothing at all.
+    """
     deadline = time.monotonic() + timeout_s
+    last = None
     while True:
         ok, frame = cap.read()
         if ok and frame is not None:
-            return True
+            if not is_black(frame):
+                return frame
+            last = frame
         if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
+            return last
+        time.sleep(0.05)
+
+
+def _open_capture(index: int, backend: int, width: int, height: int) -> Optional[cv2.VideoCapture]:
+    """Open one camera with one backend, or return None if it will not open."""
+    cap = cv2.VideoCapture(index, backend)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    # MJPG lets USB webcams send 720p at full frame rate; uncompressed
+    # formats are often capped at a few FPS. Ignored if unsupported.
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return cap
 
 
 def open_camera(
-    index: int = 0, width: int = 1280, height: int = 720, warmup_s: float = 3.0
+    index: int = 0,
+    backend: str = "auto",
+    width: int = 1280,
+    height: int = 720,
+    warmup_s: float = 3.0,
 ) -> cv2.VideoCapture:
     """Open a webcam and confirm it delivers frames.
 
     A camera held by another application often opens "successfully" but
     never returns a frame, so a test read is part of the check. Each capture
-    backend gets ``warmup_s`` seconds to produce its first frame.
+    backend gets ``warmup_s`` seconds to produce its first frame, and one
+    that sends real images is preferred over one that only sends black.
 
     Raises:
         CameraError: If the device cannot be opened or produces no frames.
     """
     opened = False
-    for backend in camera_backends():
-        cap = cv2.VideoCapture(index, backend)
-        if not cap.isOpened():
-            cap.release()
+    black_cap: Optional[cv2.VideoCapture] = None
+    for api in camera_backends(backend):
+        cap = _open_capture(index, api, width, height)
+        if cap is None:
             continue
         opened = True
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        if wait_for_frame(cap, warmup_s):
+        frame = read_first_frame(cap, warmup_s)
+        if frame is None:
+            cap.release()
+        elif not is_black(frame):
+            if black_cap is not None:
+                black_cap.release()
             return cap
-        cap.release()
+        elif black_cap is None:
+            black_cap = cap
+        else:
+            cap.release()
 
+    if black_cap is not None:
+        print(
+            f"Warning: camera {index} is only sending black frames. Check the privacy "
+            "shutter / camera kill switch, or run with --list-cameras to find the "
+            "right --camera index.",
+            file=sys.stderr,
+        )
+        return black_cap
     if not opened:
         raise CameraError(
             f"Could not open camera {index}. Check that a webcam is connected "
@@ -530,8 +590,27 @@ def open_camera(
         "  - no other app is using it (Zoom, Teams, OBS, a browser tab...)\n"
         "  - Windows Settings > Privacy & security > Camera allows desktop apps\n"
         "  - the laptop's camera privacy shutter/kill switch is off\n"
-        "  - it is the right device: try --camera 1 or --camera 2"
+        "  - it is the right device: run with --list-cameras"
     )
+
+
+def list_cameras(max_index: int = 5, backend: str = "auto") -> int:
+    """Probe camera indices and print what each one delivers. Returns 0."""
+    print("Probing cameras (this takes a few seconds)...")
+    for index in range(max_index):
+        for api in camera_backends(backend):
+            cap = _open_capture(index, api, 1280, 720)
+            if cap is None:
+                continue
+            frame = read_first_frame(cap, 1.5)
+            cap.release()
+            if frame is None:
+                status = "opens, but no frames (in use?)"
+            else:
+                status = f"{frame.shape[1]}x{frame.shape[0]}" + (", BLACK frames" if is_black(frame) else ", OK")
+            print(f"  --camera {index} --backend {BACKEND_NAMES[api]}: {status}")
+    print("Use an index marked OK, e.g. python ar_hand_filter.py --camera 1")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +630,7 @@ def draw_label(
     Args:
         image: Frame to draw on (modified in place).
         text: Label text.
-        anchor: ``"top-left"``, ``"top-right"`` or ``"bottom-center"``.
+        anchor: ``"top-left"``, ``"top-right"``, ``"bottom-center"`` or ``"center"``.
         scale: Font scale.
         margin: Distance from the image edge, in pixels.
         padding: Space between the text and the box edge, in pixels.
@@ -567,6 +646,8 @@ def draw_label(
         x, y = width - margin - box_w, margin
     elif anchor == "bottom-center":
         x, y = (width - box_w) // 2, height - margin - box_h
+    elif anchor == "center":
+        x, y = (width - box_w) // 2, (height - box_h) // 2
     else:
         raise ValueError(f"Unknown anchor: {anchor}")
 
@@ -616,8 +697,15 @@ class ARHandFilterApp:
 
     HINT = "N/S/G/I or TAB: switch filter   F: frame/full   D: debug   Q: quit"
 
-    def __init__(self, camera_index: int = 0, max_hands: int = DEFAULT_MAX_HANDS, mirror: bool = True) -> None:
+    def __init__(
+        self,
+        camera_index: int = 0,
+        max_hands: int = DEFAULT_MAX_HANDS,
+        mirror: bool = True,
+        backend: str = "auto",
+    ) -> None:
         self.camera_index = camera_index
+        self.backend = backend
         self.max_hands = max_hands
         self.mirror = mirror
         self.filters = FilterState()
@@ -628,7 +716,7 @@ class ARHandFilterApp:
     def run(self) -> int:
         """Run until the user quits. Returns a process exit code."""
         try:
-            cap = open_camera(self.camera_index)
+            cap = open_camera(self.camera_index, self.backend)
         except CameraError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -673,7 +761,8 @@ class ARHandFilterApp:
         if self.mirror:
             cv2.flip(frame, 1, dst=frame)
 
-        hands = tracker.process(frame)
+        black = is_black(frame)
+        hands = [] if black else tracker.process(frame)
         box = self.smoother.update(compute_frame_box(hands, frame.shape))
 
         self.filters.apply(frame, box)
@@ -687,6 +776,8 @@ class ARHandFilterApp:
         draw_label(frame, f"Filter: {self.filters.current.name}{scope}", "top-left")
         draw_label(frame, f"{self.fps.tick():.0f} FPS", "top-right")
         draw_label(frame, self.HINT, "bottom-center", scale=0.45)
+        if black:
+            draw_label(frame, "Camera sends black frames: open the shutter or try --list-cameras", "center", scale=0.55)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -696,6 +787,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-hands", type=int, default=DEFAULT_MAX_HANDS,
                         help="maximum hands to track; use 4 for two people (default: 2)")
     parser.add_argument("--no-mirror", action="store_true", help="do not mirror the preview")
+    parser.add_argument("--backend", choices=["auto", *CAMERA_BACKENDS], default="auto",
+                        help="OpenCV capture backend (default: auto)")
+    parser.add_argument("--list-cameras", action="store_true",
+                        help="probe camera indices and exit")
     args = parser.parse_args(argv)
     if args.max_hands < 2:
         parser.error("--max-hands must be at least 2 to form a frame")
@@ -705,7 +800,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point."""
     args = parse_args(argv)
-    app = ARHandFilterApp(camera_index=args.camera, max_hands=args.max_hands, mirror=not args.no_mirror)
+    if args.list_cameras:
+        return list_cameras(backend=args.backend)
+    app = ARHandFilterApp(
+        camera_index=args.camera,
+        max_hands=args.max_hands,
+        mirror=not args.no_mirror,
+        backend=args.backend,
+    )
     return app.run()
 
 
